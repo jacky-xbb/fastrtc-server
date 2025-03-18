@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenAI Real-Time Chat</title>
+    <style>
+        body {
+            font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: #0a0a0a;
+            color: #ffffff;
+            margin: 0;
+            padding: 20px;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            height: calc(100% - 100px);
+        }
+
+        .logo {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+
+        .chat-container {
+            border: 1px solid #333;
+            padding: 20px;
+            height: 90%;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chat-messages {
+            flex-grow: 1;
+            overflow-y: auto;
+            margin-bottom: 20px;
+            padding: 10px;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            padding: 12px;
+            border-radius: 4px;
+            font-size: 16px;
+            line-height: 1.5;
+        }
+
+        .message.user {
+            background-color: #1a1a1a;
+            margin-left: 20%;
+        }
+
+        .message.assistant {
+            background-color: #262626;
+            margin-right: 20%;
+        }
+
+        .controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        button {
+            background-color: transparent;
+            color: #ffffff;
+            border: 1px solid #ffffff;
+            padding: 12px 24px;
+            font-family: inherit;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        button:hover {
+            border-width: 2px;
+            transform: scale(1.02);
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+        }
+
+        #audio-output {
+            display: none;
+        }
+
+        .icon-with-spinner {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            min-width: 180px;
+        }
+
+        .spinner {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #ffffff;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            flex-shrink: 0;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .pulse-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            min-width: 180px;
+        }
+
+        .pulse-circle {
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background-color: #ffffff;
+            opacity: 0.2;
+            flex-shrink: 0;
+            transform: translateX(-0%) scale(var(--audio-level, 1));
+            transition: transform 0.1s ease;
+        }
+
+        /* Add styles for toast notifications */
+        .toast {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 16px 24px;
+            border-radius: 4px;
+            font-size: 14px;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+        }
+
+        .toast.error {
+            background-color: #f44336;
+            color: white;
+        }
+
+        .toast.warning {
+            background-color: #ffd700;
+            color: black;
+        }
+    </style>
+</head>
+
+<body>
+    <!-- Add toast element after body opening tag -->
+    <div id="error-toast" class="toast"></div>
+    <div class="container">
+        <div class="logo">
+            <h1>OpenAI Real-Time Chat</h1>
+        </div>
+        <div class="chat-container">
+            <div class="chat-messages" id="chat-messages"></div>
+        </div>
+        <div class="controls">
+            <button id="start-button">Start Conversation</button>
+        </div>
+    </div>
+    <audio id="audio-output"></audio>
+
+    <script>
+        let peerConnection;
+        let webrtc_id;
+        const audioOutput = document.getElementById('audio-output');
+        const startButton = document.getElementById('start-button');
+        const chatMessages = document.getElementById('chat-messages');
+
+        let audioLevel = 0;
+        let animationFrame;
+        let audioContext, analyser, audioSource;
+
+        function updateButtonState() {
+            const button = document.getElementById('start-button');
+            if (peerConnection && (peerConnection.connectionState === 'connecting' || peerConnection.connectionState === 'new')) {
+                button.innerHTML = `
+                    <div class="icon-with-spinner">
+                        <div class="spinner"></div>
+                        <span>Connecting...</span>
+                    </div>
+                `;
+            } else if (peerConnection && peerConnection.connectionState === 'connected') {
+                button.innerHTML = `
+                    <div class="pulse-container">
+                        <div class="pulse-circle"></div>
+                        <span>Stop Conversation</span>
+                    </div>
+                `;
+            } else {
+                button.innerHTML = 'Start Conversation';
+            }
+        }
+
+        function setupAudioVisualization(stream) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            audioSource = audioContext.createMediaStreamSource(stream);
+            audioSource.connect(analyser);
+            analyser.fftSize = 64;
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            function updateAudioLevel() {
+                analyser.getByteFrequencyData(dataArray);
+                const average = Array.from(dataArray).reduce((a, b) => a + b, 0) / dataArray.length;
+                audioLevel = average / 255;
+
+                // Update CSS variable instead of rebuilding the button
+                const pulseCircle = document.querySelector('.pulse-circle');
+                if (pulseCircle) {
+                    pulseCircle.style.setProperty('--audio-level', 1 + audioLevel);
+                }
+
+                animationFrame = requestAnimationFrame(updateAudioLevel);
+            }
+            updateAudioLevel();
+        }
+
+        function showError(message) {
+            const toast = document.getElementById('error-toast');
+            toast.textContent = message;
+            toast.style.display = 'block';
+
+            // Hide toast after 5 seconds
+            setTimeout(() => {
+                toast.style.display = 'none';
+            }, 5000);
+        }
+
+        async function setupWebRTC() {
+            // 设置连接状态标志
+            isConnecting = true;
+            // 获取WebRTC配置（从服务器注入的配置）
+            const config = __RTC_CONFIGURATION__;
+            // 创建新的WebRTC对等连接
+            peerConnection = new RTCPeerConnection(config);
+
+            // 设置连接超时警告（5秒后显示）
+            const timeoutId = setTimeout(() => {
+                const toast = document.getElementById('error-toast');
+                toast.textContent = "Connection is taking longer than usual. Are you on a VPN?";
+                toast.className = 'toast warning';
+                toast.style.display = 'block';
+
+                // 5秒后自动隐藏警告提示
+                setTimeout(() => {
+                    toast.style.display = 'none';
+                }, 5000);
+            }, 5000);
+
+            try {
+                // 请求用户授权并获取麦克风音频流
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: true
+                });
+
+                // 设置音频可视化效果
+                setupAudioVisualization(stream);
+
+                // 将音频轨道添加到WebRTC连接中
+                stream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, stream);
+                });
+
+                // 监听接收到的音频流
+                peerConnection.addEventListener('track', (evt) => {
+                    // 如果音频输出源不是当前流，则更新并播放
+                    if (audioOutput.srcObject !== evt.streams[0]) {
+                        audioOutput.srcObject = evt.streams[0];
+                        audioOutput.play();
+                    }
+                });
+
+                // 创建用于传输文本消息的数据通道
+                const dataChannel = peerConnection.createDataChannel('text');
+                // 监听数据通道消息
+                dataChannel.onmessage = (event) => {
+                    const eventJson = JSON.parse(event.data);
+                    // 如果收到错误消息，显示错误提示
+                    if (eventJson.type === "error") {
+                        showError(eventJson.message);
+                    }
+                };
+
+                // 创建WebRTC连接提议（offer）
+                const offer = await peerConnection.createOffer();
+                // 设置本地描述
+                await peerConnection.setLocalDescription(offer);
+
+                // 等待ICE（交互式连接建立）收集完成
+                await new Promise((resolve) => {
+                    if (peerConnection.iceGatheringState === "complete") {
+                        resolve();
+                    } else {
+                        // 如果ICE收集未完成，添加状态变化监听器
+                        const checkState = () => {
+                            if (peerConnection.iceGatheringState === "complete") {
+                                peerConnection.removeEventListener("icegatheringstatechange", checkState);
+                                resolve();
+                            }
+                        };
+                        peerConnection.addEventListener("icegatheringstatechange", checkState);
+                    }
+                });
+
+                // 监听WebRTC连接状态变化
+                peerConnection.addEventListener('connectionstatechange', () => {
+                    console.log('connectionstatechange', peerConnection.connectionState);
+                    // 如果连接成功建立，清除超时警告
+                    if (peerConnection.connectionState === 'connected') {
+                        clearTimeout(timeoutId);
+                        const toast = document.getElementById('error-toast');
+                        toast.style.display = 'none';
+                    }
+                    // 更新按钮状态显示
+                    updateButtonState();
+                });
+
+                // 生成随机的WebRTC连接ID
+                webrtc_id = Math.random().toString(36).substring(7);
+
+                // 向服务器发送WebRTC连接提议
+                const response = await fetch('/webrtc/offer', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sdp: peerConnection.localDescription.sdp,  // 会话描述协议数据
+                        type: peerConnection.localDescription.type,  // 描述类型（offer）
+                        webrtc_id: webrtc_id  // 连接ID
+                    })
+                });
+
+                // 解析服务器响应
+                const serverResponse = await response.json();
+
+                // 处理服务器响应
+                if (serverResponse.status === 'failed') {
+                    // 如果连接失败，显示错误信息
+                    showError(serverResponse.meta.error === 'concurrency_limit_reached'
+                        ? `Too many connections. Maximum limit is ${serverResponse.meta.limit}`
+                        : serverResponse.meta.error);
+                    stop();  // 停止连接
+                    return;
+                }
+
+                // 设置服务器返回的远程描述
+                await peerConnection.setRemoteDescription(serverResponse);
+
+                // 创建服务器发送事件（SSE）连接，用于接收服务器推送的消息
+                const eventSource = new EventSource('/outputs?webrtc_id=' + webrtc_id);
+                // 监听服务器推送的输出消息
+                eventSource.addEventListener("output", (event) => {
+                    const eventJson = JSON.parse(event.data);
+                    // 将助手回复添加到聊天界面
+                    addMessage("assistant", eventJson.content);
+                });
+            } catch (err) {
+                // 发生错误时，清除超时警告
+                clearTimeout(timeoutId);
+                console.error('Error setting up WebRTC:', err);
+                // 显示错误提示
+                showError('Failed to establish connection. Please try again.');
+                // 停止连接
+                stop();
+            }
+        }
+
+        function addMessage(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.classList.add('message', role);
+            messageDiv.textContent = content;
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        function stop() {
+            if (animationFrame) {
+                cancelAnimationFrame(animationFrame);
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+                analyser = null;
+                audioSource = null;
+            }
+            if (peerConnection) {
+                if (peerConnection.getTransceivers) {
+                    peerConnection.getTransceivers().forEach(transceiver => {
+                        if (transceiver.stop) {
+                            transceiver.stop();
+                        }
+                    });
+                }
+
+                if (peerConnection.getSenders) {
+                    peerConnection.getSenders().forEach(sender => {
+                        if (sender.track && sender.track.stop) sender.track.stop();
+                    });
+                }
+                console.log('closing');
+                peerConnection.close();
+            }
+            updateButtonState();
+            audioLevel = 0;
+        }
+
+        startButton.addEventListener('click', () => {
+            console.log('clicked');
+            console.log(peerConnection, peerConnection?.connectionState);
+            if (!peerConnection || peerConnection.connectionState !== 'connected') {
+                setupWebRTC();
+            } else {
+                console.log('stopping');
+                stop();
+            }
+        });
+    </script>
+</body>
+
+</html>
