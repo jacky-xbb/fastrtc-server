@@ -75,3 +75,12 @@ MODE=PHONE python app.py
 ```bash
 uvicorn app:app --reload --host 0.0.0.0 --port 7860
 ```
+
+## 服务器启动
+
+```bash
+nohup uvicorn app:app --host 0.0.0.0 --port 7860 > ./logs/fastrtc.log 2>&1 &
+echo $! > ./run/fastrtc.pid
+```
+
+

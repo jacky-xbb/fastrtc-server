@@ -2,3 +2,4 @@ fastrtc[vad]
 openai
 twilio
 python-dotenv
+uvicorn[standard]
