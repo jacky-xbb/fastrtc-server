@@ -76,11 +76,70 @@ MODE=PHONE python app.py
 uvicorn app:app --reload --host 0.0.0.0 --port 7860
 ```
 
-## 服务器启动
+## Ubuntu 守护进程配置
+
+在 Ubuntu 系统中将应用配置为系统服务，实现开机自启动和自动重启：
+
+1. 创建系统服务配置文件：
 
 ```bash
-nohup uvicorn app:app --host 0.0.0.0 --port 7860 > ./logs/fastrtc.log 2>&1 &
-echo $! > ./run/fastrtc.pid
+sudo nano /etc/systemd/system/fastrtc.service
 ```
+
+2. 添加以下配置内容：
+
+```ini
+[Unit]
+Description=FastRTC Server
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fastrtc-server
+Environment="PATH=/home/ubuntu/fastrtc-server/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/fastrtc-server/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 7860 --workers 4
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. 启动和管理服务：
+
+```bash
+# 重新加载 systemd 配置
+sudo systemctl daemon-reload
+
+# 启动服务
+sudo systemctl start fastrtc
+
+# 设置开机自启
+sudo systemctl enable fastrtc
+
+# 查看服务状态
+sudo systemctl status fastrtc
+```
+
+4. 常用管理命令：
+
+```bash
+# 停止服务
+sudo systemctl stop fastrtc
+
+# 重启服务
+sudo systemctl restart fastrtc
+
+# 查看实时日志
+sudo journalctl -u fastrtc -f
+
+# 查看最近的日志
+sudo journalctl -u fastrtc -n 100
+```
+
+注意：请根据实际情况修改配置文件中的路径和用户名。
+
+
 
 

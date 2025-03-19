@@ -156,6 +156,7 @@
             color: black;
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/alawmulaw"></script>
 </head>
 
 <body>
@@ -175,8 +176,8 @@
     <audio id="audio-output"></audio>
 
     <script>
-        let peerConnection;
-        let webrtc_id;
+        let webSocket;
+        let websocket_id;
         const audioOutput = document.getElementById('audio-output');
         const startButton = document.getElementById('start-button');
         const chatMessages = document.getElementById('chat-messages');
@@ -184,17 +185,23 @@
         let audioLevel = 0;
         let animationFrame;
         let audioContext, analyser, audioSource;
+        let outputContext, processor;
+        let isConnecting = false;
+        let audioQueue = [];
+        let isPlaying = false;
+        let pingInterval;
+        let rttValues = [];
 
         function updateButtonState() {
             const button = document.getElementById('start-button');
-            if (peerConnection && (peerConnection.connectionState === 'connecting' || peerConnection.connectionState === 'new')) {
+            if (isConnecting) {
                 button.innerHTML = `
                     <div class="icon-with-spinner">
                         <div class="spinner"></div>
                         <span>Connecting...</span>
                     </div>
                 `;
-            } else if (peerConnection && peerConnection.connectionState === 'connected') {
+            } else if (webSocket && webSocket.readyState === WebSocket.OPEN) {
                 button.innerHTML = `
                     <div class="pulse-container">
                         <div class="pulse-circle"></div>
@@ -233,6 +240,7 @@
         function showError(message) {
             const toast = document.getElementById('error-toast');
             toast.textContent = message;
+            toast.className = 'toast error';
             toast.style.display = 'block';
 
             // Hide toast after 5 seconds
@@ -241,13 +249,60 @@
             }, 5000);
         }
 
-        async function setupWebRTC() {
+        function resample(audioData, fromSampleRate, toSampleRate) {
+            const ratio = fromSampleRate / toSampleRate;
+            const newLength = Math.round(audioData.length / ratio);
+            const result = new Float32Array(newLength);
+
+            for (let i = 0; i < newLength; i++) {
+                const position = i * ratio;
+                const index = Math.floor(position);
+                const fraction = position - index;
+
+                if (index + 1 < audioData.length) {
+                    result[i] = audioData[index] * (1 - fraction) + audioData[index + 1] * fraction;
+                } else {
+                    result[i] = audioData[index];
+                }
+            }
+            return result;
+        }
+
+        function convertToMulaw(audioData, sampleRate) {
+            // Resample to 8000 Hz if needed
+            if (sampleRate !== 8000) {
+                audioData = resample(audioData, sampleRate, 8000);
+            }
+
+            // Convert float32 [-1,1] to int16 [-32768,32767]
+            const int16Data = new Int16Array(audioData.length);
+            for (let i = 0; i < audioData.length; i++) {
+                int16Data[i] = Math.floor(audioData[i] * 32768);
+            }
+
+            // Convert to mu-law using the library
+            return alawmulaw.mulaw.encode(int16Data);
+        }
+
+        function playNextBuffer() {
+            if (audioQueue.length === 0) {
+                isPlaying = false;
+                return;
+            }
+
+            isPlaying = true;
+            const bufferSource = outputContext.createBufferSource();
+            bufferSource.buffer = audioQueue.shift();
+            bufferSource.connect(outputContext.destination);
+
+            bufferSource.onended = playNextBuffer;
+            bufferSource.start();
+        }
+
+        async function setupWebSocket() {
             // 设置连接状态标志
             isConnecting = true;
-            // 获取WebRTC配置（从服务器注入的配置）
-            const config = __RTC_CONFIGURATION__;
-            // 创建新的WebRTC对等连接
-            peerConnection = new RTCPeerConnection(config);
+            updateButtonState();
 
             // 设置连接超时警告（5秒后显示）
             const timeoutId = setTimeout(() => {
@@ -265,103 +320,157 @@
             try {
                 // 请求用户授权并获取麦克风音频流
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    audio: true
+                    audio: {
+                        "echoCancellation": true,
+                        "noiseSuppression": { "exact": true },
+                        "autoGainControl": { "exact": true },
+                        "sampleRate": { "ideal": 24000 },
+                        "sampleSize": { "ideal": 16 },
+                        "channelCount": { "exact": 1 },
+                    }
                 });
 
                 // 设置音频可视化效果
                 setupAudioVisualization(stream);
 
-                // 将音频轨道添加到WebRTC连接中
-                stream.getTracks().forEach(track => {
-                    peerConnection.addTrack(track, stream);
-                });
+                // 生成随机的WebSocket连接ID
+                websocket_id = Math.random().toString(36).substring(7);
 
-                // 监听接收到的音频流
-                peerConnection.addEventListener('track', (evt) => {
-                    // 如果音频输出源不是当前流，则更新并播放
-                    if (audioOutput.srcObject !== evt.streams[0]) {
-                        audioOutput.srcObject = evt.streams[0];
-                        audioOutput.play();
+                // 创建和设置音频上下文
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                audioSource = audioContext.createMediaStreamSource(stream);
+                audioSource.connect(analyser);
+
+                // 创建输出上下文
+                outputContext = new AudioContext({ sampleRate: 24000 });
+
+                // 连接到WebSocket
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                webSocket = new WebSocket(`${wsProtocol}//${window.location.host}/websocket/offer`);
+
+                webSocket.onopen = () => {
+                    // 清除连接超时警告
+                    clearTimeout(timeoutId);
+                    isConnecting = false;
+                    updateButtonState();
+
+                    // 发送初始化消息
+                    webSocket.send(JSON.stringify({
+                        event: "start",
+                        websocket_id: websocket_id
+                    }));
+
+                    // 设置音频处理器
+                    processor = audioContext.createScriptProcessor(2048, 1, 1);
+                    audioSource.connect(processor);
+                    processor.connect(audioContext.destination);
+
+                    processor.onaudioprocess = (e) => {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const mulawData = convertToMulaw(inputData, audioContext.sampleRate);
+                        const base64Audio = btoa(String.fromCharCode.apply(null, mulawData));
+                        
+                        if (webSocket.readyState === WebSocket.OPEN) {
+                            webSocket.send(JSON.stringify({
+                                event: "media",
+                                media: {
+                                    payload: base64Audio
+                                }
+                            }));
+                        }
+                    };
+
+                    // 设置ping间隔，计算RTT
+                    pingInterval = setInterval(() => {
+                        if (webSocket.readyState === WebSocket.OPEN) {
+                            // 发送ping并记录发送时间
+                            window.pingStartTime = performance.now();
+                            webSocket.send(JSON.stringify({
+                                event: "ping"
+                            }));
+                        }
+                    }, 1000);
+                };
+
+                webSocket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    // 处理pong响应，计算RTT
+                    if (data.event === "pong" && window.pingStartTime) {
+                        const rtt = performance.now() - window.pingStartTime;
+                        rttValues.push(rtt);
+                        // 保留最近20个值计算平均RTT
+                        if (rttValues.length > 20) {
+                            rttValues.shift();
+                        }
+                        return;
                     }
-                });
 
-                // 创建用于传输文本消息的数据通道
-                const dataChannel = peerConnection.createDataChannel('text');
-                // 监听数据通道消息
-                dataChannel.onmessage = (event) => {
-                    const eventJson = JSON.parse(event.data);
-                    // 如果收到错误消息，显示错误提示
-                    if (eventJson.type === "error") {
-                        showError(eventJson.message);
+                    // 处理错误消息
+                    if (data.type === "error") {
+                        showError(data.message);
+                        return;
+                    }
+
+                    // 处理来自服务器的音频数据
+                    if (data.event === "media" && data.media && data.media.payload) {
+                        const audioData = atob(data.media.payload);
+                        const mulawData = new Uint8Array(audioData.length);
+                        for (let i = 0; i < audioData.length; i++) {
+                            mulawData[i] = audioData.charCodeAt(i);
+                        }
+
+                        // 转换mu-law到线性PCM
+                        const linearData = alawmulaw.mulaw.decode(mulawData);
+                        
+                        // 创建音频缓冲区
+                        const sampleRate = 24000; // 服务器采样率
+                        const audioBuffer = outputContext.createBuffer(1, linearData.length, sampleRate);
+                        const channelData = audioBuffer.getChannelData(0);
+                        
+                        // 填充解码数据
+                        for (let i = 0; i < linearData.length; i++) {
+                            channelData[i] = linearData[i] / 32768.0;
+                        }
+                        
+                        // 加入音频队列
+                        audioQueue.push(audioBuffer);
+                        
+                        // 如果尚未播放，开始播放
+                        if (!isPlaying) {
+                            playNextBuffer();
+                        }
+                    }
+
+                    // 处理信息发送指令
+                    if (data.type === "send_input") {
+                        fetch('/input_hook', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify({
+                                websocket_id: websocket_id,
+                                chatbot: []
+                            })
+                        });
                     }
                 };
 
-                // 创建WebRTC连接提议（offer）
-                const offer = await peerConnection.createOffer();
-                // 设置本地描述
-                await peerConnection.setLocalDescription(offer);
+                webSocket.onclose = () => {
+                    console.log('WebSocket connection closed');
+                    stop();
+                };
 
-                // 等待ICE（交互式连接建立）收集完成
-                await new Promise((resolve) => {
-                    if (peerConnection.iceGatheringState === "complete") {
-                        resolve();
-                    } else {
-                        // 如果ICE收集未完成，添加状态变化监听器
-                        const checkState = () => {
-                            if (peerConnection.iceGatheringState === "complete") {
-                                peerConnection.removeEventListener("icegatheringstatechange", checkState);
-                                resolve();
-                            }
-                        };
-                        peerConnection.addEventListener("icegatheringstatechange", checkState);
-                    }
-                });
-
-                // 监听WebRTC连接状态变化
-                peerConnection.addEventListener('connectionstatechange', () => {
-                    console.log('connectionstatechange', peerConnection.connectionState);
-                    // 如果连接成功建立，清除超时警告
-                    if (peerConnection.connectionState === 'connected') {
-                        clearTimeout(timeoutId);
-                        const toast = document.getElementById('error-toast');
-                        toast.style.display = 'none';
-                    }
-                    // 更新按钮状态显示
-                    updateButtonState();
-                });
-
-                // 生成随机的WebRTC连接ID
-                webrtc_id = Math.random().toString(36).substring(7);
-
-                // 向服务器发送WebRTC连接提议
-                const response = await fetch('/webrtc/offer', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        sdp: peerConnection.localDescription.sdp,  // 会话描述协议数据
-                        type: peerConnection.localDescription.type,  // 描述类型（offer）
-                        webrtc_id: webrtc_id  // 连接ID
-                    })
-                });
-
-                // 解析服务器响应
-                const serverResponse = await response.json();
-
-                // 处理服务器响应
-                if (serverResponse.status === 'failed') {
-                    // 如果连接失败，显示错误信息
-                    showError(serverResponse.meta.error === 'concurrency_limit_reached'
-                        ? `Too many connections. Maximum limit is ${serverResponse.meta.limit}`
-                        : serverResponse.meta.error);
-                    stop();  // 停止连接
-                    return;
-                }
-
-                // 设置服务器返回的远程描述
-                await peerConnection.setRemoteDescription(serverResponse);
+                webSocket.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    showError('Connection error. Please try again.');
+                    stop();
+                };
 
                 // 创建服务器发送事件（SSE）连接，用于接收服务器推送的消息
-                const eventSource = new EventSource('/outputs?webrtc_id=' + webrtc_id);
+                const eventSource = new EventSource('/outputs?websocket_id=' + websocket_id);
                 // 监听服务器推送的输出消息
                 eventSource.addEventListener("output", (event) => {
                     const eventJson = JSON.parse(event.data);
@@ -371,7 +480,7 @@
             } catch (err) {
                 // 发生错误时，清除超时警告
                 clearTimeout(timeoutId);
-                console.error('Error setting up WebRTC:', err);
+                console.error('Error setting up WebSocket:', err);
                 // 显示错误提示
                 showError('Failed to establish connection. Please try again.');
                 // 停止连接
@@ -388,41 +497,61 @@
         }
 
         function stop() {
+            isConnecting = false;
+            
+            // 清理动画帧
             if (animationFrame) {
                 cancelAnimationFrame(animationFrame);
             }
+            
+            // 清理音频上下文
             if (audioContext) {
+                if (processor) {
+                    processor.disconnect();
+                    processor = null;
+                }
                 audioContext.close();
                 audioContext = null;
                 analyser = null;
                 audioSource = null;
             }
-            if (peerConnection) {
-                if (peerConnection.getTransceivers) {
-                    peerConnection.getTransceivers().forEach(transceiver => {
-                        if (transceiver.stop) {
-                            transceiver.stop();
-                        }
-                    });
-                }
-
-                if (peerConnection.getSenders) {
-                    peerConnection.getSenders().forEach(sender => {
-                        if (sender.track && sender.track.stop) sender.track.stop();
-                    });
-                }
-                console.log('closing');
-                peerConnection.close();
+            
+            // 清理输出上下文
+            if (outputContext) {
+                outputContext.close();
+                outputContext = null;
             }
+            
+            // 清空音频队列
+            audioQueue = [];
+            isPlaying = false;
+            
+            // 清理ping间隔
+            if (pingInterval) {
+                clearInterval(pingInterval);
+                pingInterval = null;
+            }
+            
+            // 关闭WebSocket连接
+            if (webSocket) {
+                if (webSocket.readyState === WebSocket.OPEN) {
+                    webSocket.send(JSON.stringify({
+                        event: "stop"
+                    }));
+                }
+                webSocket.close();
+                webSocket = null;
+            }
+            
             updateButtonState();
             audioLevel = 0;
+            rttValues = [];
         }
 
         startButton.addEventListener('click', () => {
             console.log('clicked');
-            console.log(peerConnection, peerConnection?.connectionState);
-            if (!peerConnection || peerConnection.connectionState !== 'connected') {
-                setupWebRTC();
+            if (!webSocket || webSocket.readyState !== WebSocket.OPEN) {
+                setupWebSocket();
             } else {
                 console.log('stopping');
                 stop();
