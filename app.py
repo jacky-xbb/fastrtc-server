@@ -19,6 +19,12 @@ from fastrtc import (  # 导入fastrtc库，用于实时通信
 from gradio.utils import get_space  # 导入Gradio工具函数，用于检测是否在Hugging Face Space环境中
 from openai.types.beta.realtime import ResponseAudioTranscriptDoneEvent  # 导入OpenAI实时API事件类型
 
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # 加载.env文件中的环境变量
 load_dotenv()
 
